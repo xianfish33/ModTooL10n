@@ -31,18 +31,91 @@ func (m *Model) handleTransPathKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) handleTransLangKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
-		path := strings.TrimSpace(m.pathInput.Value())
 		langStr := strings.TrimSpace(m.langInput.Value())
 		if langStr == "" {
 			langStr = "简体中文"
 		}
-		m.state = stResolvingLang
-		return m, m.resolveLang(path, langStr, false)
+		m.state = stTransOutputMode
+		m.outputModeCursor = 0
 	case "esc":
 		m.state = stTransPath
 	}
 	var cmd tea.Cmd
 	m.langInput, cmd = m.langInput.Update(msg)
+	return m, cmd
+}
+
+// ── Output Mode Selection ────────────────────────────────────
+
+func (m *Model) outputModeView() string {
+	var b strings.Builder
+	title := "选择输出方式"
+	if m.state == stBatchOutputMode {
+		title = "选择输出方式"
+	}
+	b.WriteString(titleStyle.Render(" " + title + " "))
+	b.WriteString("\n\n")
+
+	items := []string{"输出为Mod文件", "输出为资源包"}
+	for i, item := range items {
+		line := fmt.Sprintf("  %s", item)
+		b.WriteString(focusLine(line, i == m.outputModeCursor) + "\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(padLine(helpStyle.Render("方向键: 浏览  •  Enter: 选择  •  Esc: 返回")))
+	return b.String()
+}
+
+func (m *Model) handleTransOutputModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		wrapCursor(&m.outputModeCursor, 2, -1)
+	case "down", "j":
+		wrapCursor(&m.outputModeCursor, 2, 1)
+	case "enter":
+		path := strings.TrimSpace(m.pathInput.Value())
+		langStr := strings.TrimSpace(m.langInput.Value())
+		if langStr == "" {
+			langStr = "简体中文"
+		}
+		switch m.outputModeCursor {
+		case 0:
+			m.outputMode = string(engine.OutputModeMod)
+			m.state = stResolvingLang
+			return m, m.resolveLang(path, langStr, false)
+		case 1:
+			m.outputMode = string(engine.OutputModePack)
+			m.state = stTransPackName
+			m.packNameInput.Reset()
+			m.packNameInput.Focus()
+		}
+	case "esc":
+		m.state = stTransLang
+	}
+	return m, nil
+}
+
+func (m *Model) handleTransPackNameKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		path := strings.TrimSpace(m.pathInput.Value())
+		langStr := strings.TrimSpace(m.langInput.Value())
+		if langStr == "" {
+			langStr = "简体中文"
+		}
+		v := strings.TrimSpace(m.packNameInput.Value())
+		if v == "" {
+			v = "ModTooL10n资源包"
+		}
+		m.packName = v
+		m.state = stResolvingLang
+		return m, m.resolveLang(path, langStr, false)
+	case "esc":
+		m.state = stTransOutputMode
+	}
+	var cmd tea.Cmd
+	m.packNameInput, cmd = m.packNameInput.Update(msg)
 	return m, cmd
 }
 
@@ -87,27 +160,32 @@ func (m *Model) startSingleTranslate(path string, targetLang string) tea.Cmd {
 			return transDoneMsg{err: fmt.Errorf("获取提供商失败: %v", err)}
 		}
 
+		code := m.targetLangCode
+		if code == "" {
+			code = targetLang
+		}
+
 		eng := engine.NewEngine(engine.ProviderConfig{
-			BaseURL:    provider.BaseURL,
-			APIKey:     provider.APIKey,
-			ModelName:  provider.GetActiveModel(),
-			MaxKeys:    m.cfg.MaxChunkKeys,
-			MaxRetries: m.cfg.MaxRetries,
+			BaseURL:        provider.BaseURL,
+			APIKey:         provider.APIKey,
+			ModelName:      provider.GetActiveModel(),
+			MaxKeys:        m.cfg.MaxChunkKeys,
+			MaxRetries:     m.cfg.MaxRetries,
+			RetryMode:      m.cfg.RetryMode,
+			RetryThreshold: m.cfg.RetryThreshold,
 		})
 
 		if err := eng.ValidateProvider(); err != nil {
 			return transDoneMsg{err: err}
 		}
 
-		code := m.targetLangCode
-		if code == "" {
-			code = targetLang
-		}
+		outputMode := engine.OutputMode(m.outputMode)
+		packName := m.packName
 
 		pd := &engine.SingleProgress{}
 		m.transProgress = pd
 
-		eng.StartSingle(path, targetLang, code, pd)
+		eng.StartSingle(path, targetLang, code, outputMode, packName, pd)
 		return progressTickMsg{}
 	}
 }
@@ -215,7 +293,11 @@ func (m *Model) transWaitView() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(padLine(helpStyle.Render("翻译进行中，请稍候...")))
+	helpText := "翻译进行中，请稍候..."
+	if pd.Phase == "completed" {
+		helpText = "按 Enter 或 Esc 返回"
+	}
+	b.WriteString(padLine(helpStyle.Render(helpText)))
 	return b.String()
 }
 
@@ -242,9 +324,6 @@ func (m *Model) transResultView() string {
 		if r.Skipped {
 			b.WriteString(fmt.Sprintf("  [%s] %s\n", successStyle.Render("已存在"), r.ModID))
 			b.WriteString(fmt.Sprintf("    %s\n", dimStyle.Render(r.SkipMsg)))
-			if r.OutputPath != "" {
-				b.WriteString(fmt.Sprintf("    %s\n", dimStyle.Render("输出: "+r.OutputPath)))
-			}
 		} else if r.ChunksFail > 0 && r.ChunksOK == 0 {
 			hasErrors = true
 			status := "失败"
@@ -256,18 +335,26 @@ func (m *Model) transResultView() string {
 		} else if r.ChunksFail > 0 {
 			hasErrors = true
 			b.WriteString(fmt.Sprintf("  [%s] %s", successStyle.Render("部分成功"), r.ModID))
-			if r.OutputPath != "" {
-				b.WriteString(fmt.Sprintf(" -> %s", r.OutputPath))
+			outPath := engine.ShortResultPath(r)
+			if outPath != "" {
+				b.WriteString(fmt.Sprintf(" -> %s", outPath))
 			}
 			b.WriteString(fmt.Sprintf("  (%d/%d 分块失败, 已用原文填充)", r.ChunksFail, r.ChunksTotal))
 			b.WriteString("\n")
 		} else {
 			b.WriteString(fmt.Sprintf("  [%s] %s", successStyle.Render("成功"), r.ModID))
-			if r.OutputPath != "" {
-				b.WriteString(fmt.Sprintf(" -> %s", r.OutputPath))
+			outPath := engine.ShortResultPath(r)
+			if outPath != "" {
+				b.WriteString(fmt.Sprintf(" -> %s", outPath))
 			}
 			b.WriteString("\n")
 		}
+	}
+
+	// Show pack path if it's a resource pack
+	if len(m.transResults) > 0 && m.transResults[0] != nil && m.transResults[0].PackPath != "" {
+		b.WriteString(fmt.Sprintf("  %s %s\n", successStyle.Render("资源包:"), m.transResults[0].PackPath))
+		b.WriteString("\n")
 	}
 
 	b.WriteString("\n")
@@ -291,6 +378,8 @@ func (m *Model) handleTransResultKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.state = stMenu
 		m.transResults = nil
 		m.err = nil
+		m.outputMode = ""
+		m.packName = ""
 	}
 	return m, nil
 }

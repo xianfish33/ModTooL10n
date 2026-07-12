@@ -4,23 +4,72 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 )
 
-func ValidateStructure(raw string) error {
-	trimmed := strings.TrimSpace(raw)
-	if !strings.HasPrefix(trimmed, "{") {
-		return fmt.Errorf("response does not start with '{'")
+// stripJSONQuotedContent removes all quoted strings (including the quotes)
+// from a JSON string, leaving only structural characters and whitespace.
+// Handles escaped quotes inside strings correctly.
+func stripJSONQuotedContent(s string) string {
+	var result strings.Builder
+	inString := false
+	escaped := false
+	for _, r := range s {
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			if r == '"' {
+				inString = false
+			}
+			continue
+		}
+		if r == '"' {
+			inString = true
+			continue
+		}
+		result.WriteRune(r)
 	}
-	if !strings.HasSuffix(trimmed, "}") {
-		return fmt.Errorf("response does not end with '}'")
+	return result.String()
+}
+
+// collapseWhitespace replaces all whitespace sequences with a single space
+// and trims leading/trailing whitespace.
+func collapseWhitespace(s string) string {
+	var result strings.Builder
+	lastWasSpace := false
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			if !lastWasSpace {
+				result.WriteRune(' ')
+				lastWasSpace = true
+			}
+		} else {
+			result.WriteRune(r)
+			lastWasSpace = false
+		}
 	}
-	var v interface{}
-	if err := json.Unmarshal([]byte(trimmed), &v); err != nil {
-		return fmt.Errorf("invalid JSON: %w", err)
-	}
-	_, ok := v.(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("JSON root is not an object")
+	return strings.TrimSpace(result.String())
+}
+
+// ValidateChunkStructure compares the structural skeleton of the original
+// chunk JSON and the model output by stripping all quoted strings and
+// comparing the remaining characters (ignoring whitespace).
+// This accepts fragments without {} wrapping as well as complete JSON objects.
+func ValidateChunkStructure(originalJSON, output string) error {
+	origStripped := stripJSONQuotedContent(originalJSON)
+	outStripped := stripJSONQuotedContent(output)
+
+	origStripped = collapseWhitespace(origStripped)
+	outStripped = collapseWhitespace(outStripped)
+
+	if origStripped != outStripped {
+		return fmt.Errorf("structure mismatch")
 	}
 	return nil
 }

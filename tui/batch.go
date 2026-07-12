@@ -30,18 +30,71 @@ func (m *Model) handleBatchPathKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) handleBatchLangKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
-		path := strings.TrimSpace(m.pathInput.Value())
 		langStr := strings.TrimSpace(m.langInput.Value())
 		if langStr == "" {
 			langStr = "简体中文"
 		}
-		m.state = stBatchResolving
-		return m, m.resolveLang(path, langStr, true)
+		m.state = stBatchOutputMode
+		m.outputModeCursor = 0
 	case "esc":
 		m.state = stBatchPath
 	}
 	var cmd tea.Cmd
 	m.langInput, cmd = m.langInput.Update(msg)
+	return m, cmd
+}
+
+// ── Batch Output Mode Selection ──────────────────────────────
+
+func (m *Model) handleBatchOutputModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		wrapCursor(&m.outputModeCursor, 2, -1)
+	case "down", "j":
+		wrapCursor(&m.outputModeCursor, 2, 1)
+	case "enter":
+		path := strings.TrimSpace(m.pathInput.Value())
+		langStr := strings.TrimSpace(m.langInput.Value())
+		if langStr == "" {
+			langStr = "简体中文"
+		}
+		switch m.outputModeCursor {
+		case 0:
+			m.outputMode = string(engine.OutputModeMod)
+			m.state = stBatchResolving
+			return m, m.resolveLang(path, langStr, true)
+		case 1:
+			m.outputMode = string(engine.OutputModePack)
+			m.state = stBatchPackName
+			m.packNameInput.Reset()
+			m.packNameInput.Focus()
+		}
+	case "esc":
+		m.state = stBatchLang
+	}
+	return m, nil
+}
+
+func (m *Model) handleBatchPackNameKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		path := strings.TrimSpace(m.pathInput.Value())
+		langStr := strings.TrimSpace(m.langInput.Value())
+		if langStr == "" {
+			langStr = "简体中文"
+		}
+		v := strings.TrimSpace(m.packNameInput.Value())
+		if v == "" {
+			v = "ModTooL10n资源包"
+		}
+		m.packName = v
+		m.state = stBatchResolving
+		return m, m.resolveLang(path, langStr, true)
+	case "esc":
+		m.state = stBatchOutputMode
+	}
+	var cmd tea.Cmd
+	m.packNameInput, cmd = m.packNameInput.Update(msg)
 	return m, cmd
 }
 
@@ -54,27 +107,32 @@ func (m *Model) startBatchTranslate(path string, targetLang string) tea.Cmd {
 			return transDoneMsg{err: fmt.Errorf("获取提供商失败: %v", err)}
 		}
 
+		code := m.targetLangCode
+		if code == "" {
+			code = targetLang
+		}
+
 		eng := engine.NewEngine(engine.ProviderConfig{
-			BaseURL:    provider.BaseURL,
-			APIKey:     provider.APIKey,
-			ModelName:  provider.GetActiveModel(),
-			MaxKeys:    m.cfg.MaxChunkKeys,
-			MaxRetries: m.cfg.MaxRetries,
+			BaseURL:        provider.BaseURL,
+			APIKey:         provider.APIKey,
+			ModelName:      provider.GetActiveModel(),
+			MaxKeys:        m.cfg.MaxChunkKeys,
+			MaxRetries:     m.cfg.MaxRetries,
+			RetryMode:      m.cfg.RetryMode,
+			RetryThreshold: m.cfg.RetryThreshold,
 		})
 
 		if err := eng.ValidateProvider(); err != nil {
 			return transDoneMsg{err: err}
 		}
 
-		code := m.targetLangCode
-		if code == "" {
-			code = targetLang
-		}
+		outputMode := engine.OutputMode(m.outputMode)
+		packName := m.packName
 
 		bp := &engine.BatchProgress{}
 		m.batchProgress = bp
 
-		eng.StartBatch(path, targetLang, code, bp)
+		eng.StartBatch(path, targetLang, code, outputMode, packName, bp)
 		return progressTickMsg{}
 	}
 }
@@ -130,12 +188,20 @@ func (m *Model) batchWaitView() string {
 	}
 
 	// ── Phase: completed ──
-	if bp.Phase == "completed" {
+	if bp.Phase == "completed" || bp.Phase == "failed" {
 		var all []string
-		all = append(all, titleStyle.Render(" 批量翻译完成 "))
+		title := "批量翻译完成"
+		subtitle := fmt.Sprintf("共翻译 %d 个mod", bp.TotalMods)
+		if bp.Phase == "failed" {
+			title = "批量翻译出错"
+			if bp.Err != nil {
+				subtitle = fmt.Sprintf("错误: %v", bp.Err)
+			}
+		}
+		all = append(all, titleStyle.Render(fmt.Sprintf(" %s ", title)))
 		all = append(all, "")
-		all = append(all, padLine(successStyle.Render(fmt.Sprintf("共翻译 %d 个mod", bp.TotalMods))))
-		all = append(all, m.viewportPad(all, padLine(helpStyle.Render("翻译进行中，请稍候...  滚轮: 上下查看")))...)
+		all = append(all, padLine(successStyle.Render(subtitle)))
+		all = append(all, m.viewportPad(all, padLine(helpStyle.Render("按 Enter 或 Esc 返回")))...)
 		return strings.Join(all, "\n")
 	}
 
@@ -409,9 +475,6 @@ func (m *Model) batchResultView() string {
 		if r.Skipped {
 			all = append(all, fmt.Sprintf("  [%s] %s", successStyle.Render("已存在"), r.ModID))
 			all = append(all, fmt.Sprintf("    %s", dimStyle.Render(r.SkipMsg)))
-			if r.OutputPath != "" {
-				all = append(all, fmt.Sprintf("    %s", dimStyle.Render("输出: "+r.OutputPath)))
-			}
 		} else if r.ChunksFail > 0 && r.ChunksOK == 0 {
 			hasErrors = true
 			status := "失败"
@@ -423,18 +486,25 @@ func (m *Model) batchResultView() string {
 		} else if r.ChunksFail > 0 {
 			hasErrors = true
 			line := fmt.Sprintf("  [%s] %s", successStyle.Render("部分成功"), r.ModID)
-			if r.OutputPath != "" {
-				line += fmt.Sprintf(" -> %s", r.OutputPath)
+			outPath := engine.ShortResultPath(r)
+			if outPath != "" {
+				line += fmt.Sprintf(" -> %s", outPath)
 			}
 			line += fmt.Sprintf("  (%d/%d 分块失败, 已用原文填充)", r.ChunksFail, r.ChunksTotal)
 			all = append(all, line)
 		} else {
 			line := fmt.Sprintf("  [%s] %s", successStyle.Render("成功"), r.ModID)
-			if r.OutputPath != "" {
-				line += fmt.Sprintf(" -> %s", r.OutputPath)
+			outPath := engine.ShortResultPath(r)
+			if outPath != "" {
+				line += fmt.Sprintf(" -> %s", outPath)
 			}
 			all = append(all, line)
 		}
+	}
+
+	if bp.PackPath != "" {
+		all = append(all, "")
+		all = append(all, fmt.Sprintf("  %s %s", successStyle.Render("资源包:"), bp.PackPath))
 	}
 
 	helpText := "按 Enter 或 Esc 返回"
@@ -467,6 +537,8 @@ func (m *Model) handleBatchResultKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.state = stMenu
 		m.batchProgress = nil
 		m.err = nil
+		m.outputMode = ""
+		m.packName = ""
 	}
 	return m, nil
 }

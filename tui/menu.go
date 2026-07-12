@@ -11,7 +11,7 @@ type menuState struct {
 	cursor int
 }
 
-const menuItemCount = 5
+const menuItemCount = 6
 
 func (m *Model) menuView() string {
 	var b strings.Builder
@@ -23,6 +23,7 @@ func (m *Model) menuView() string {
 		"批量翻译Mods目录",
 		"管理翻译提供商",
 		"选择使用的模型",
+		"设置",
 		"关于",
 	}
 
@@ -60,7 +61,10 @@ func (m *Model) handleMenuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case 3: // 选择使用的模型
 			m.state = stGlobalSelectModel
 			m.detailCursor = 0
-		case 4: // 关于
+		case 4: // 设置
+			m.state = stSettings
+			m.settingsCursor = 0
+		case 5: // 关于
 			m.state = stAbout
 		}
 	case "q", "esc", "ctrl+c":

@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,12 +11,16 @@ import (
 )
 
 type TranslatorConfig struct {
-	MaxChunkKeys int
-	MaxRetries   int
-	TargetLang   string
-	TargetCode   string
-	OutputDir    string
-	OnProgress   func(ProgressInfo)
+	MaxChunkKeys   int
+	MaxRetries     int
+	TargetLang     string
+	TargetCode     string
+	OutputDir      string
+	OutputMode     OutputMode
+	PackName       string
+	RetryMode      RetryMode
+	RetryThreshold int
+	OnProgress     func(ProgressInfo)
 }
 
 type ProgressInfo struct {
@@ -41,6 +46,15 @@ func NewTranslator(client *LLMClient, cfg TranslatorConfig) *Translator {
 	}
 	if cfg.MaxChunkKeys <= 0 {
 		cfg.MaxChunkKeys = 50
+	}
+	if cfg.RetryMode == "" {
+		cfg.RetryMode = RetryModeCorrect
+	}
+	if cfg.RetryThreshold <= 0 {
+		cfg.RetryThreshold = 2
+	}
+	if cfg.RetryThreshold > cfg.MaxRetries {
+		cfg.RetryThreshold = cfg.MaxRetries
 	}
 	return &Translator{client: client, cfg: cfg}
 }
@@ -126,15 +140,37 @@ func (t *Translator) TranslateWithJar(modID string, data TranslationMap, modName
 				}
 				if keysMatch {
 					// Language file already exists with matching keys
-					jarOut := filepath.Join(t.cfg.OutputDir, modID+".jar")
-					if err := RepackJAR(cacheDir, jarOut); err == nil {
+					switch t.cfg.OutputMode {
+					case OutputModeMod:
+						jarOut := filepath.Join(t.cfg.OutputDir, modID+".jar")
+						if err := RepackJAR(cacheDir, jarOut); err == nil {
+							return &Result{
+								ModID:      modID,
+								OutputPath: jarOut,
+								TotalKeys:  len(data),
+								Skipped:    true,
+								SkipMsg:    fmt.Sprintf("%s.json 语言文件已存在，跳过翻译", targetCode),
+							}, nil
+						}
+					case OutputModePack:
 						return &Result{
 							ModID:      modID,
-							OutputPath: jarOut,
+							OutputPath: "",
 							TotalKeys:  len(data),
 							Skipped:    true,
 							SkipMsg:    fmt.Sprintf("%s.json 语言文件已存在，跳过翻译", targetCode),
 						}, nil
+					default:
+						jarOut := filepath.Join(t.cfg.OutputDir, modID+".jar")
+						if err := RepackJAR(cacheDir, jarOut); err == nil {
+							return &Result{
+								ModID:      modID,
+								OutputPath: jarOut,
+								TotalKeys:  len(data),
+								Skipped:    true,
+								SkipMsg:    fmt.Sprintf("%s.json 语言文件已存在，跳过翻译", targetCode),
+							}, nil
+						}
 					}
 					return &Result{
 						ModID:      modID,
@@ -186,12 +222,14 @@ func (t *Translator) TranslateWithJar(modID string, data TranslationMap, modName
 			// If first attempt failed, retry up to MaxRetries
 			if cr.err != nil && t.cfg.MaxRetries > 1 {
 				retryChunkJSON, _ := ChunkToJSON(c)
+				originalOuterPrompt := fmt.Sprintf("请翻译以下JSON内容 (%d/%d):\n\n%s", idx+1, len(chunks), retryChunkJSON)
+				correctiveOuterFmt := "你的翻译输出有误，请严格检查并重新翻译。这是分块JSON，可能不以{开头或不以}结尾，这是正常的。必须返回与输入完全相同键集合的纯JSON片段，不要补全大括号或添加额外内容。\n\n原始JSON:\n%s"
 				for retry := 2; retry <= t.cfg.MaxRetries; retry++ {
 					if progressFn != nil {
 						progressFn(ProgressInfo{ChunkIdx: idx, TotalChunks: len(chunks), Status: "retrying", KeysTotal: len(data), ChunkKeys: len(c), Retry: retry, MaxRetries: t.cfg.MaxRetries, Error: cr.err})
 					}
 
-					retryPrompt := fmt.Sprintf("你的翻译输出有误，请严格检查并重新翻译。这是分块JSON，可能不以{开头或不以}结尾，这是正常的。必须返回与输入完全相同键集合的纯JSON片段，不要补全大括号或添加额外内容。\n\n原始JSON:\n%s", retryChunkJSON)
+					retryPrompt := t.retryPrompt(originalOuterPrompt, retry, retryChunkJSON, correctiveOuterFmt)
 					retryRaw, retryErr := t.client.ChatStream(systemPrompt, retryPrompt, func(acc string) {
 						if progressFn != nil {
 							count := countParsedKeys(acc, c)
@@ -206,7 +244,7 @@ func (t *Translator) TranslateWithJar(modID string, data TranslationMap, modName
 					}
 
 					cleaned := cleanResponse(retryRaw)
-					if err := ValidateStructure(cleaned); err != nil {
+					if err := ValidateChunkStructure(retryChunkJSON, cleaned); err != nil {
 						cr.err = fmt.Errorf("retry %d structure: %w", retry, err)
 						continue
 					}
@@ -282,31 +320,77 @@ func (t *Translator) TranslateWithJar(modID string, data TranslationMap, modName
 		progressFn(ProgressInfo{Status: "saving", KeysTotal: len(data)})
 	}
 
-	if cacheDir != "" && enJarPath != "" {
-		targetJarPath := deriveTargetLangPath(enJarPath, targetCode)
-		targetFile := filepath.Join(cacheDir, targetJarPath)
-		if err := os.MkdirAll(filepath.Dir(targetFile), 0755); err != nil {
-			return nil, fmt.Errorf("create lang dir: %w", err)
-		}
-		if err := SaveLangPretty(targetFile, merged); err != nil {
-			return nil, fmt.Errorf("save lang file: %w", err)
+	switch t.cfg.OutputMode {
+	case OutputModeMod:
+		if cacheDir != "" && enJarPath != "" {
+			targetJarPath := deriveTargetLangPath(enJarPath, targetCode)
+			targetFile := filepath.Join(cacheDir, targetJarPath)
+			if err := os.MkdirAll(filepath.Dir(targetFile), 0755); err != nil {
+				return nil, fmt.Errorf("create lang dir: %w", err)
+			}
+			if err := SaveLangPretty(targetFile, merged); err != nil {
+				return nil, fmt.Errorf("save lang file: %w", err)
+			}
+
+			jarOut := filepath.Join(t.cfg.OutputDir, modID+".jar")
+			if err := RepackJAR(cacheDir, jarOut); err != nil {
+				return nil, fmt.Errorf("repack jar: %w", err)
+			}
+			result.OutputPath = jarOut
+		} else {
+			outputDir := filepath.Join(t.cfg.OutputDir, modID)
+			if err := os.MkdirAll(outputDir, 0755); err != nil {
+				return nil, fmt.Errorf("create output dir: %w", err)
+			}
+			outputPath := filepath.Join(outputDir, targetCode+".json")
+			if err := SaveLangPretty(outputPath, merged); err != nil {
+				return nil, fmt.Errorf("save output: %w", err)
+			}
+			result.OutputPath = outputPath
 		}
 
-		jarOut := filepath.Join(t.cfg.OutputDir, modID+".jar")
-		if err := RepackJAR(cacheDir, jarOut); err != nil {
-			return nil, fmt.Errorf("repack jar: %w", err)
+	case OutputModePack:
+		packName := SanitizePackName(t.cfg.PackName)
+		if packName == "" {
+			packName = "resourcepack"
 		}
-		result.OutputPath = jarOut
-	} else {
-		outputDir := filepath.Join(t.cfg.OutputDir, modID)
-		if err := os.MkdirAll(outputDir, 0755); err != nil {
-			return nil, fmt.Errorf("create output dir: %w", err)
+		packDir := filepath.Join(t.cfg.OutputDir, packName)
+		assetPath := filepath.Join(packDir, "assets", modID, "lang", targetCode+".json")
+		if err := os.MkdirAll(filepath.Dir(assetPath), 0755); err != nil {
+			return nil, fmt.Errorf("create asset dir: %w", err)
 		}
-		outputPath := filepath.Join(outputDir, targetCode+".json")
-		if err := SaveLangPretty(outputPath, merged); err != nil {
-			return nil, fmt.Errorf("save output: %w", err)
+		if err := SaveLangPretty(assetPath, merged); err != nil {
+			return nil, fmt.Errorf("save lang file: %w", err)
 		}
-		result.OutputPath = outputPath
+		result.OutputPath = assetPath
+
+	default:
+		if cacheDir != "" && enJarPath != "" {
+			targetJarPath := deriveTargetLangPath(enJarPath, targetCode)
+			targetFile := filepath.Join(cacheDir, targetJarPath)
+			if err := os.MkdirAll(filepath.Dir(targetFile), 0755); err != nil {
+				return nil, fmt.Errorf("create lang dir: %w", err)
+			}
+			if err := SaveLangPretty(targetFile, merged); err != nil {
+				return nil, fmt.Errorf("save lang file: %w", err)
+			}
+
+			jarOut := filepath.Join(t.cfg.OutputDir, modID+".jar")
+			if err := RepackJAR(cacheDir, jarOut); err != nil {
+				return nil, fmt.Errorf("repack jar: %w", err)
+			}
+			result.OutputPath = jarOut
+		} else {
+			outputDir := filepath.Join(t.cfg.OutputDir, modID)
+			if err := os.MkdirAll(outputDir, 0755); err != nil {
+				return nil, fmt.Errorf("create output dir: %w", err)
+			}
+			outputPath := filepath.Join(outputDir, targetCode+".json")
+			if err := SaveLangPretty(outputPath, merged); err != nil {
+				return nil, fmt.Errorf("save output: %w", err)
+			}
+			result.OutputPath = outputPath
+		}
 	}
 
 	if progressFn != nil {
@@ -327,18 +411,30 @@ func (t *Translator) translateChunk(idx int, systemPrompt string, chunk Translat
 		return nil, fmt.Errorf("marshal chunk: %w", err)
 	}
 
-	userPrompt := fmt.Sprintf("请翻译以下JSON内容 (%d/%d):\n\n%s", idx+1, totalChunks, chunkJSON)
+	originalPrompt := fmt.Sprintf("请翻译以下JSON内容 (%d/%d):\n\n%s", idx+1, totalChunks, chunkJSON)
+	userPrompt := originalPrompt
 
 	var lastErr error
-	for attempt := 1; attempt <= t.cfg.MaxRetries; attempt++ {
+	maxAttempts := t.cfg.MaxRetries
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		var (
 			raw string
 			err error
 		)
 		if onParsed != nil {
+			deltaCount := 0
+			lastReported := 0
 			raw, err = t.client.ChatStream(systemPrompt, userPrompt, func(acc string) {
+				deltaCount++
+				if deltaCount%3 != 0 {
+					return
+				}
 				count := countParsedKeys(acc, chunk)
-				if count > 0 {
+				if count > lastReported {
+					lastReported = count
 					onParsed(count, len(chunk))
 				}
 			})
@@ -347,24 +443,30 @@ func (t *Translator) translateChunk(idx int, systemPrompt string, chunk Translat
 		}
 		if err != nil {
 			lastErr = fmt.Errorf("API call: %w", err)
+			if err != nil && raw != "" {
+				lastErr = fmt.Errorf("API call (partial): %w", err)
+			}
 			continue
 		}
 
 		cleaned := cleanResponse(raw)
 
-		if err := ValidateStructure(cleaned); err != nil {
+		// Structural validation — strip quoted content and compare skeleton.
+		// This is lenient: accepts fragments without {} and trailing commas.
+		if err := ValidateChunkStructure(chunkJSON, cleaned); err != nil {
 			lastErr = fmt.Errorf("structure: %w", err)
 			if attempt < t.cfg.MaxRetries {
-				userPrompt = fmt.Sprintf("你的输出格式不正确，必须返回纯JSON片段，不要包含任何额外文字说明。这是分块JSON，可能不以{开头或不以}结尾，这是正常的，不要补全。\n请严格按照以下格式返回（只返回JSON片段）：\n{\"key1\": \"value1\", \"key2\": \"value2\"}\n\n原始JSON:\n%s", chunkJSON)
+				userPrompt = t.retryPrompt(originalPrompt, attempt, chunkJSON,
+					"你的输出结构有误，请确保返回的JSON片段拥有与输入完全相同数量的键值对。这是分块JSON，请原样返回每个键值对。\n原始JSON:\n%s")
 			}
 			continue
 		}
 
 		translated := make(TranslationMap)
 		if err := json.Unmarshal([]byte(cleaned), &translated); err != nil {
-			lastErr = fmt.Errorf("unmarshal: %w", err)
 			if attempt < t.cfg.MaxRetries {
-				userPrompt = fmt.Sprintf("你的输出包含非法JSON，请只返回纯JSON片段，不要包含任何额外文字说明。这是分块JSON，可能不以{开头或不以}结尾，这是正常的，不要补全。\n请严格按照以下格式返回（只返回JSON片段）：\n{\"key1\": \"value1\", \"key2\": \"value2\"}\n\n原始JSON:\n%s", chunkJSON)
+				userPrompt = t.retryPrompt(originalPrompt, attempt, chunkJSON,
+					"你的输出包含非法JSON，请只返回纯JSON片段。这是分块JSON，可能不以{开头或不以}结尾，这是正常的，不要补全。\n请严格按照以下格式返回（只返回JSON片段）：\n{\"key1\": \"value1\", \"key2\": \"value2\"}\n\n原始JSON:\n%s")
 			}
 			continue
 		}
@@ -372,7 +474,8 @@ func (t *Translator) translateChunk(idx int, systemPrompt string, chunk Translat
 		vRes := ValidateKeys(chunk, translated)
 		if len(vRes.MissingKeys) > 0 {
 			lastErr = fmt.Errorf("missing %d keys: %v", len(vRes.MissingKeys), vRes.MissingKeys)
-			userPrompt = fmt.Sprintf("以下键缺失了翻译，请补全并返回完整的JSON片段（不要补全大括号，这是分块JSON）：\n缺失键: %v\n\n原始JSON:\n%s", vRes.MissingKeys, chunkJSON)
+			userPrompt = t.retryPrompt(originalPrompt, attempt, chunkJSON,
+				"以下键缺失了翻译，请补全并返回完整的JSON片段（不要补全大括号，这是分块JSON）：\n缺失键: %v\n\n原始JSON:\n%s")
 			continue
 		}
 
@@ -380,6 +483,22 @@ func (t *Translator) translateChunk(idx int, systemPrompt string, chunk Translat
 	}
 
 	return nil, lastErr
+}
+
+func (t *Translator) retryPrompt(originalPrompt string, attempt int, chunkJSON string, correctiveFmt string) string {
+	switch t.cfg.RetryMode {
+	case RetryModeNewContext:
+		return originalPrompt
+	case RetryModeCorrect:
+		return fmt.Sprintf(correctiveFmt, chunkJSON)
+	case RetryModeThreshold:
+		if attempt <= t.cfg.RetryThreshold {
+			return fmt.Sprintf(correctiveFmt, chunkJSON)
+		}
+		return originalPrompt
+	default:
+		return fmt.Sprintf(correctiveFmt, chunkJSON)
+	}
 }
 
 func countParsedKeys(cleaned string, chunk TranslationMap) int {
@@ -414,13 +533,60 @@ func cleanResponse(raw string) string {
 		raw = strings.Join(cleaned, "\n")
 	}
 
-	if idx := strings.Index(raw, "{"); idx > 0 {
+	if idx := strings.Index(raw, "{"); idx >= 0 {
 		raw = raw[idx:]
 	}
-	if idx := strings.LastIndex(raw, "}"); idx >= 0 && idx < len(raw)-1 {
+	if idx := strings.LastIndex(raw, "}"); idx >= 0 {
 		raw = raw[:idx+1]
+	}
+
+	// No braces found — this is a chunk fragment (e.g. middle chunk without {})
+	// Remove trailing comma and wrap in {}
+	if !strings.HasPrefix(raw, "{") {
+		raw = strings.TrimRight(raw, ", \t\r\n")
+		raw = "{" + raw + "}"
 	}
 
 	raw = strings.TrimSpace(raw)
 	return raw
+}
+
+func copyFile(src, dst string) error {
+	s, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	d, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+
+	_, err = io.Copy(d, s)
+	return err
+}
+
+func CleanCache() error {
+	return os.RemoveAll(CacheRoot)
+}
+
+// ShortResultPath returns a short display path for the result.
+// In pack mode (path contains /assets/ or \assets\), shows "modid -> code.json".
+// Otherwise returns the full path.
+func ShortResultPath(r *Result) string {
+	if r == nil || r.OutputPath == "" {
+		return ""
+	}
+	p := r.OutputPath
+	// Detect pack mode: path contains /assets/ or \assets\
+	if strings.Contains(p, "/assets/") || strings.Contains(p, "\\assets\\") {
+		return fmt.Sprintf("%s -> %s", r.ModID, filepath.Base(p))
+	}
+	return p
 }

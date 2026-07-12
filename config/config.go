@@ -22,30 +22,23 @@ type Provider struct {
 }
 
 type Config struct {
-	Providers    []Provider `json:"providers"`
-	MaxChunkKeys int        `json:"max_chunk_keys"`
-	Concurrency  int        `json:"concurrency"`
-	MaxRetries   int        `json:"max_retries"`
-	OutputDir    string     `json:"output_dir"`
+	Providers      []Provider `json:"providers"`
+	MaxChunkKeys   int        `json:"max_chunk_keys"`
+	Concurrency    int        `json:"concurrency"`
+	MaxRetries     int        `json:"max_retries"`
+	OutputDir      string     `json:"output_dir"`
+	RetryMode      string     `json:"retry_mode"`
+	RetryThreshold int        `json:"retry_threshold"`
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		Providers: []Provider{
-			{
-				Name:    "default",
-				BaseURL: "https://api.openai.com/v1",
-				APIKey:  "",
-				Models: []ModelConfig{
-					{Name: "gpt-4o-mini", Active: true},
-				},
-				SelectedModel: "gpt-4o-mini",
-			},
-		},
-		MaxChunkKeys: 50,
-		Concurrency:  2,
-		MaxRetries:   3,
-		OutputDir:    "output",
+		MaxChunkKeys:   50,
+		Concurrency:    2,
+		MaxRetries:     3,
+		OutputDir:      "output",
+		RetryMode:      "correct",
+		RetryThreshold: 2,
 	}
 }
 
@@ -84,6 +77,7 @@ func Load() (*Config, error) {
 	if cfg.MaxChunkKeys <= 0 {
 		cfg.MaxChunkKeys = 50
 	}
+	cfg.MaxChunkKeys = ((cfg.MaxChunkKeys + 9) / 10) * 10
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 3
 	}

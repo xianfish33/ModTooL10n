@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"path/filepath"
 	"sync"
 )
 
@@ -28,7 +29,7 @@ func (e *Engine) ResolveLangCode(input string) string {
 	return ResolveLangCode(client, input)
 }
 
-func (e *Engine) StartSingle(path string, targetLang string, targetCode string, progress *SingleProgress) {
+func (e *Engine) StartSingle(path string, targetLang string, targetCode string, outputMode OutputMode, packName string, progress *SingleProgress) {
 	jars, err := ScanJARs(path)
 	if err != nil {
 		progress.Mu.Lock()
@@ -111,11 +112,15 @@ func (e *Engine) StartSingle(path string, targetLang string, targetCode string, 
 
 		go func() {
 		tr := NewTranslator(client, TranslatorConfig{
-			MaxChunkKeys: e.provider.MaxKeys,
-			MaxRetries:   e.provider.MaxRetries,
-			TargetLang:   targetLang,
-			TargetCode:   code,
-			OutputDir:    OutputRoot,
+			MaxChunkKeys:   e.provider.MaxKeys,
+			MaxRetries:     e.provider.MaxRetries,
+			TargetLang:     targetLang,
+			TargetCode:     code,
+			OutputDir:      OutputRoot,
+			OutputMode:     outputMode,
+			PackName:       packName,
+			RetryMode:      RetryMode(e.provider.RetryMode),
+			RetryThreshold: e.provider.RetryThreshold,
 			OnProgress: func(info ProgressInfo) {
 				progress.Mu.Lock()
 				defer progress.Mu.Unlock()
@@ -159,6 +164,20 @@ func (e *Engine) StartSingle(path string, targetLang string, targetCode string, 
 		})
 
 		result, err := tr.TranslateWithJar(jr.ModMeta.ID, data, modName, jr.ModMeta.Description, enFile.Path, jr.CacheDir)
+		if err == nil && result != nil && outputMode == OutputModePack && result.OutputPath != "" {
+			packName := SanitizePackName(packName)
+			if packName == "" {
+				packName = "resourcepack"
+			}
+			packDir := filepath.Join(OutputRoot, packName)
+			zipPath, zipErr := CreateResourcePack(packDir, packName)
+			if zipErr == nil {
+				result.PackPath = zipPath
+			} else {
+				result.Errors = append(result.Errors, fmt.Sprintf("创建资源包失败: %v", zipErr))
+			}
+		}
+		CleanCache()
 		progress.Mu.Lock()
 		progress.AllDone = true
 		progress.Err = err
@@ -167,7 +186,7 @@ func (e *Engine) StartSingle(path string, targetLang string, targetCode string, 
 	}()
 }
 
-func (e *Engine) StartBatch(path string, targetLang string, targetCode string, progress *BatchProgress) {
+func (e *Engine) StartBatch(path string, targetLang string, targetCode string, outputMode OutputMode, packName string, progress *BatchProgress) {
 	jars, err := ScanJARs(path)
 	if err != nil {
 		progress.Mu.Lock()
@@ -288,11 +307,15 @@ func (e *Engine) StartBatch(path string, targetLang string, targetCode string, p
 				}
 
 				tr := NewTranslator(client, TranslatorConfig{
-					MaxChunkKeys: e.provider.MaxKeys,
-					MaxRetries:   e.provider.MaxRetries,
-					TargetLang:   targetLang,
-					TargetCode:   code,
-					OutputDir:    OutputRoot,
+					MaxChunkKeys:   e.provider.MaxKeys,
+					MaxRetries:     e.provider.MaxRetries,
+					TargetLang:     targetLang,
+					TargetCode:     code,
+					OutputDir:      OutputRoot,
+					OutputMode:     outputMode,
+					PackName:       packName,
+					RetryMode:      RetryMode(e.provider.RetryMode),
+					RetryThreshold: e.provider.RetryThreshold,
 					OnProgress: func(info ProgressInfo) {
 						progress.Mu.Lock()
 						defer progress.Mu.Unlock()
@@ -375,8 +398,30 @@ func (e *Engine) StartBatch(path string, targetLang string, targetCode string, p
 
 		wg.Wait()
 
+		if outputMode == OutputModePack && len(results) > 0 {
+			packName := SanitizePackName(packName)
+			if packName == "" {
+				packName = "resourcepack"
+			}
+			packDir := filepath.Join(OutputRoot, packName)
+			zipPath, zipErr := CreateResourcePack(packDir, packName)
+			progress.Mu.Lock()
+			if zipErr == nil {
+				progress.PackPath = zipPath
+			} else if len(results) > 0 && results[0] != nil {
+				results[0].Errors = append(results[0].Errors, fmt.Sprintf("创建资源包失败: %v", zipErr))
+			}
+			progress.Mu.Unlock()
+		}
+
+		CleanCache()
+
 		progress.Mu.Lock()
-		progress.Phase = "completed"
+		if firstErr != nil {
+			progress.Phase = "failed"
+		} else {
+			progress.Phase = "completed"
+		}
 		progress.AllDone = true
 		progress.Err = firstErr
 		progress.Results = results

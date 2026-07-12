@@ -52,6 +52,8 @@ const (
 	// Translate single mod
 	stTransPath
 	stTransLang
+	stTransOutputMode
+	stTransPackName
 	stResolvingLang
 	stTransWait
 	stTransResult
@@ -59,6 +61,8 @@ const (
 	// Batch translate
 	stBatchPath
 	stBatchLang
+	stBatchOutputMode
+	stBatchPackName
 	stBatchResolving
 	stBatchWait
 	stBatchResult
@@ -68,6 +72,9 @@ const (
 
 	// About
 	stAbout
+
+	// Settings
+	stSettings
 )
 
 type (
@@ -115,6 +122,7 @@ type Model struct {
 	keyInput  textinput.Model
 	pathInput textinput.Model
 	langInput textinput.Model
+	packNameInput textinput.Model
 
 	loadedModels      []string
 	selectedAddModels []string
@@ -127,6 +135,9 @@ type Model struct {
 	menuCursor        int
 	transStatus       string
 	targetLangCode    string
+	outputMode        string
+	outputModeCursor  int
+	packName          string
 	transResults      []*engine.Result
 
 	unavailableModels []string
@@ -144,6 +155,7 @@ type Model struct {
 	err       error
 	prevState state
 	quitting  bool
+	settingsCursor int
 }
 
 func New(cfg *config.Config) *Model {
@@ -191,6 +203,7 @@ func New(cfg *config.Config) *Model {
 		keyInput:  makeInput("sk-...", 60, textinput.EchoPassword),
 		pathInput: makeInput("输入文件或目录路径...", 60, textinput.EchoNormal),
 		langInput: makeInput("简体中文", 60, textinput.EchoNormal),
+		packNameInput: makeInput("输入资源包名称...", 60, textinput.EchoNormal),
 		transBar:  pb,
 	}
 }
@@ -288,7 +301,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			bpResults := m.batchProgress.Results
 			m.batchProgress.Mu.Unlock()
 			if allDone {
-				if bpErr != nil {
+				if bpErr != nil && len(bpResults) == 0 {
 					return m, m.showErrorCmd(bpErr, m.state)
 				}
 				m.transResults = bpResults
@@ -302,14 +315,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pdResult := m.transProgress.Result
 			m.transProgress.Mu.Unlock()
 			if allDone {
-				if pdErr != nil {
-					return m, m.showErrorCmd(pdErr, m.state)
-				} else if pdResult != nil {
+				if pdResult != nil {
 					m.transResults = []*engine.Result{pdResult}
+					m.state = stTransResult
+				} else if pdErr != nil {
+					return m, m.showErrorCmd(pdErr, m.state)
 				} else {
 					return m, m.showErrorCmd(fmt.Errorf("未知错误：未返回结果"), m.state)
 				}
-				m.state = stTransResult
 				m.transProgress = nil
 				return m, nil
 			}
@@ -411,6 +424,15 @@ func (m *Model) inputView() string {
 		prompt = "目标语言 (如 简体中文, zh_cn):"
 		input = &m.langInput
 
+	case stTransPackName:
+		title = "翻译单个Mod"
+		prompt = "资源包名称:"
+		input = &m.packNameInput
+	case stBatchPackName:
+		title = "批量翻译Mods目录"
+		prompt = "资源包名称:"
+		input = &m.packNameInput
+
 	case stModelListURL:
 		title = "设置模型列表地址"
 		prompt = "自动获取模型列表失败，请手动输入API地址"
@@ -480,8 +502,10 @@ func (m *Model) View() string {
 		view = m.loadingView("正在测试模型连通性...")
 	case stTestModelResult:
 		view = m.testModelResultView()
-	case stTransPath, stTransLang, stBatchPath, stBatchLang:
+	case stTransPath, stTransLang, stTransPackName, stBatchPath, stBatchLang, stBatchPackName:
 		view = m.inputView()
+	case stTransOutputMode, stBatchOutputMode:
+		view = m.outputModeView()
 	case stResolvingLang, stBatchResolving:
 		view = m.loadingView("正在解析语言代码...")
 	case stTransWait, stBatchWait:
@@ -494,6 +518,8 @@ func (m *Model) View() string {
 		view = m.errorView()
 	case stAbout:
 		view = m.aboutView()
+	case stSettings:
+		view = m.settingsView()
 	}
 	return m.padForScreen(view)
 }
@@ -536,13 +562,57 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleTransPathKey(msg)
 	case stTransLang:
 		return m.handleTransLangKey(msg)
+	case stTransOutputMode:
+		return m.handleTransOutputModeKey(msg)
+	case stTransPackName:
+		return m.handleTransPackNameKey(msg)
 	case stTransResult:
 		return m.handleTransResultKey(msg)
+
+	case stTransWait:
+		// Allow exiting from progress view only when translation has finished
+		if m.transProgress != nil {
+			m.transProgress.Mu.Lock()
+			done := m.transProgress.AllDone
+			m.transProgress.Mu.Unlock()
+			if done {
+				switch msg.String() {
+				case "enter", "esc", " ":
+					m.state = stMenu
+					m.transProgress = nil
+					m.err = nil
+					return m, nil
+				}
+			}
+		}
+		return m, nil
+
+	case stBatchWait:
+		// Allow exiting from progress view only when translation has finished
+		if m.batchProgress != nil {
+			m.batchProgress.Mu.Lock()
+			done := m.batchProgress.AllDone
+			m.batchProgress.Mu.Unlock()
+			if done {
+				switch msg.String() {
+				case "enter", "esc", " ":
+					m.state = stMenu
+					m.batchProgress = nil
+					m.err = nil
+					return m, nil
+				}
+			}
+		}
+		return m, nil
 
 	case stBatchPath:
 		return m.handleBatchPathKey(msg)
 	case stBatchLang:
 		return m.handleBatchLangKey(msg)
+	case stBatchOutputMode:
+		return m.handleBatchOutputModeKey(msg)
+	case stBatchPackName:
+		return m.handleBatchPackNameKey(msg)
 	case stBatchResult:
 		return m.handleBatchResultKey(msg)
 
@@ -550,6 +620,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleErrorKey(msg)
 	case stAbout:
 		return m.handleAboutKey(msg)
+	case stSettings:
+		return m.handleSettingsKey(msg)
 	}
 	return m, nil
 }
@@ -570,7 +642,20 @@ func (m *Model) handleErrorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter", "esc":
 		m.err = nil
-		m.state = m.prevState
+		// Map loading/waiting states back to their input pages,
+		// otherwise the user would get stuck on an infinite spinner.
+		switch m.prevState {
+		case stResolvingLang:
+			m.state = stTransLang
+		case stBatchResolving:
+			m.state = stBatchLang
+		case stTransWait:
+			m.state = stTransLang
+		case stBatchWait:
+			m.state = stBatchLang
+		default:
+			m.state = m.prevState
+		}
 		m.prevState = 0
 		return m, nil
 	}

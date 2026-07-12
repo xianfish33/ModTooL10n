@@ -11,6 +11,21 @@ const (
 
 const MaxConcurrentMods = 3
 
+type OutputMode string
+
+const (
+	OutputModeMod  OutputMode = "mod"
+	OutputModePack OutputMode = "pack"
+)
+
+type RetryMode string
+
+const (
+	RetryModeNewContext RetryMode = "new_context"
+	RetryModeCorrect    RetryMode = "correct"
+	RetryModeThreshold  RetryMode = "threshold"
+)
+
 type TranslationMap map[string]string
 
 type LangFile struct {
@@ -45,6 +60,7 @@ type ChunkState struct {
 type Result struct {
 	ModID       string
 	OutputPath  string
+	PackPath    string
 	TotalKeys   int
 	ChunksTotal int
 	ChunksOK    int
@@ -92,14 +108,17 @@ type BatchProgress struct {
 	Err          error
 	Results      []*Result
 	ScrollOffset int
+	PackPath     string
 }
 
 type ProviderConfig struct {
-	BaseURL    string
-	APIKey     string
-	ModelName  string
-	MaxKeys    int
-	MaxRetries int
+	BaseURL        string
+	APIKey         string
+	ModelName      string
+	MaxKeys        int
+	MaxRetries     int
+	RetryMode      string
+	RetryThreshold int
 }
 
 type ValidationResult struct {

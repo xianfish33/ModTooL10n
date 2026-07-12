@@ -29,7 +29,7 @@ func (m *Model) aboutView() string {
 	var all []string
 	all = append(all, titleStyle.Render(" 关于 "))
 	all = append(all, "")
-	all = append(all, padLine(nameStyle.Render("ModTooL10n"))+"  "+dimStyle.Render("v1.0.0"))
+	all = append(all, padLine(nameStyle.Render("ModTooL10n"))+"  "+dimStyle.Render("v1.1.0"))
 	all = append(all, "")
 	all = append(all, padLine(labelStyle.Render("Minecraft模组自动汉化工具")))
 	all = append(all, padLine(dimStyle.Render("自动提取、翻译、注入模组语言文件")))

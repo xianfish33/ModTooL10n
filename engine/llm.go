@@ -91,7 +91,7 @@ func (c *LLMClient) Chat(system, user string) (string, error) {
 			{Role: "user", Content: user},
 		},
 		Temperature: 0.3,
-		MaxTokens:   4096,
+		MaxTokens:   8192,
 	}
 
 	body, err := json.Marshal(req)
@@ -151,7 +151,7 @@ func (c *LLMClient) ChatStream(system, user string, onDelta func(string)) (strin
 			{Role: "user", Content: user},
 		},
 		Temperature: 0.3,
-		MaxTokens:   4096,
+		MaxTokens:   8192,
 		Stream:      true,
 	}
 
@@ -197,10 +197,10 @@ func (c *LLMClient) ChatStream(system, user string, onDelta func(string)) (strin
 		}
 		var sr StreamResponse
 		if err := json.Unmarshal([]byte(data), &sr); err != nil {
-			return "", fmt.Errorf("parse stream data: %w", err)
+			return full.String(), fmt.Errorf("parse stream data: %w", err)
 		}
 		if sr.Error != nil {
-			return "", fmt.Errorf("API stream error: %s", sr.Error.Message)
+			return full.String(), fmt.Errorf("API stream error: %s", sr.Error.Message)
 		}
 		for _, ch := range sr.Choices {
 			if ch.Delta.Content != "" {
@@ -210,7 +210,7 @@ func (c *LLMClient) ChatStream(system, user string, onDelta func(string)) (strin
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("read stream: %w", err)
+		return full.String(), fmt.Errorf("read stream: %w", err)
 	}
 
 	return full.String(), nil
