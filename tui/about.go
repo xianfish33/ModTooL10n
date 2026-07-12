@@ -43,7 +43,7 @@ func (m *Model) aboutView() string {
 	}{
 		{"特别谢鸣 - opencodezen 提供免费模型额度", "https://opencode.ai/docs/zh-cn/zen/", "#B7B1B1"},
 		{"@咸味闲鱼", "https://github.com/xianfish33", "#3BA3F0"},
-		{"GitHub仓库", "https://github.com/example/ModTooL10n/issues", "#FFFFFF"},
+		{"GitHub仓库", "https://github.com/xianfish33/ModTooL10n", "#FFFFFF"},
 	}
 
 	for _, l := range links {
